@@ -1,1 +1,187 @@
-Aam Hackers Project
+import os
+import io
+import json
+import time
+import queue
+import threading
+from typing import List, Dict, Any
+from flask import Flask, request, jsonify, send_file
+import soundfile as sf
+import numpy as np
+import cv2
+try:
+    import torch
+    from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer, GPT2LMHeadModel, GPT2Tokenizer
+except Exception:
+    pipeline = None
+    AutoModelForSeq2SeqLM = None
+    AutoTokenizer = None
+    GPT2LMHeadModel = None
+    GPT2Tokenizer = None
+try:
+    import speech_recognition as sr
+except Exception:
+    sr = None
+app = Flask(__name__)
+MODELS = {}
+class AudioProcessor:
+    def __init__(self):
+        self.recognizer = sr.Recognizer() if sr else None
+    def load_wav(self, path):
+        data, sr_ = sf.read(path)
+        return data, sr_
+    def transcribe_wav(self, path, language='hi-IN'):
+        if not self.recognizer:
+            return ""
+        with sf.SoundFile(path) as f:
+            audio_data = f.read(dtype='int16')
+            audio_bytes = io.BytesIO()
+            sf.write(audio_bytes, audio_data, f.samplerate, format='WAV')
+            audio_bytes.seek(0)
+            with sr.AudioFile(audio_bytes) as source:
+                audio = self.recognizer.record(source)
+                try:
+                    text = self.recognizer.recognize_google(audio, language=language)
+                except Exception:
+                    text = ""
+                return text
+class VideoProcessor:
+    def __init__(self):
+        pass
+    def analyze_video(self, path):
+        cap = cv2.VideoCapture(path)
+        frames = 0
+        motions = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+            motions += int(np.mean(blurred) > 10)
+        cap.release()
+        return {"frames": frames, "motions": motions}
+class SensorProcessor:
+    def __init__(self):
+        pass
+    def parse_gps(self, data):
+        try:
+            lat = float(data.get('lat',0))
+            lon = float(data.get('lon',0))
+        except Exception:
+            lat = 0.0
+            lon = 0.0
+        return {"lat": lat, "lon": lon}
+class Translator:
+    def __init__(self, src='hi', tgt='en'):
+        self.src = src
+        self.tgt = tgt
+        self.model_name = f'Helsinki-NLP/opus-mt-{src}-{tgt}'
+        self.model = None
+        self.tokenizer = None
+        if AutoModelForSeq2SeqLM:
+            try:
+                self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            except Exception:
+                self.model = None
+                self.tokenizer = None
+    def translate(self, text):
+        if self.model and self.tokenizer:
+            inputs = self.tokenizer(text, return_tensors='pt', truncation=True)
+            out = self.model.generate(**inputs, max_length=512)
+            return self.tokenizer.decode(out[0], skip_special_tokens=True)
+        return text
+class GenerativeAI:
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        if GPT2LMHeadModel:
+            try:
+                self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+                self.model = GPT2LMHeadModel.from_pretrained('gpt2')
+            except Exception:
+                self.model = None
+                self.tokenizer = None
+    def generate_lesson(self, context: Dict[str,Any], max_length=200):
+        prompt = f"Create an AR language lesson for context: {json.dumps(context)}"
+        if self.model and self.tokenizer:
+            inputs = self.tokenizer.encode(prompt, return_tensors='pt')
+            outputs = self.model.generate(inputs, max_length=max_length, do_sample=True, top_p=0.95, top_k=50)
+            return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return f"Lesson for {context.get('topic','general')} in languages {context.get('languages',[])}"
+class FusionModel:
+    def __init__(self):
+        pass
+    def fuse(self, audio_text: str, visual: Dict[str,Any], sensor: Dict[str,Any]):
+        features = {
+            'audio_text': audio_text,
+            'visual_summary': f"frames:{visual.get('frames',0)} motions:{visual.get('motions',0)}",
+            'location': sensor
+        }
+        combined = ' | '.join([str(features['audio_text']), features['visual_summary'], json.dumps(features['location'])])
+        return combined
+class ReinforcementLearner:
+    def __init__(self):
+        self.q = {}
+    def update(self, state, feedback_score):
+        self.q[state] = self.q.get(state,0)*0.9 + feedback_score*0.1
+    def recommend(self, state):
+        return self.q.get(state,0)
+audio_processor = AudioProcessor()
+video_processor = VideoProcessor()
+sensor_processor = SensorProcessor()
+translator_hi_en = Translator('hi','en')
+generative = GenerativeAI()
+fusion = FusionModel()
+rl_agent = ReinforcementLearner()
+@app.route('/upload_audio', methods=['POST'])
+def upload_audio():
+    f = request.files.get('file')
+    lang = request.form.get('lang','hi-IN')
+    if not f:
+        return jsonify({'error':'no file'}),400
+    path = os.path.join('/tmp', f.filename)
+    f.save(path)
+    text = audio_processor.transcribe_wav(path, language=lang)
+    translated = translator_hi_en.translate(text)
+    os.remove(path)
+    return jsonify({'transcript': text, 'translation': translated})
+@app.route('/upload_video', methods=['POST'])
+def upload_video():
+    f = request.files.get('file')
+    if not f:
+        return jsonify({'error':'no file'}),400
+    path = os.path.join('/tmp', f.filename)
+    f.save(path)
+    visual = video_processor.analyze_video(path)
+    os.remove(path)
+    return jsonify({'visual': visual})
+@app.route('/create_lesson', methods=['POST'])
+def create_lesson():
+    payload = request.json or {}
+    audio_text = payload.get('audio_text','')
+    visual = payload.get('visual',{})
+    sensor = payload.get('sensor',{})
+    fused = fusion.fuse(audio_text, visual, sensor)
+    lesson = generative.generate_lesson({'topic': payload.get('topic','everyday phrases'), 'context': fused, 'languages': payload.get('languages',['hi','en'])})
+    return jsonify({'lesson': lesson})
+@app.route('/feedback', methods=['POST'])
+def feedback():
+    payload = request.json or {}
+    state = payload.get('state','')
+    score = float(payload.get('score',1.0))
+    rl_agent.update(state, score)
+    return jsonify({'q_value': rl_agent.recommend(state)})
+@app.route('/demo_fusion', methods=['POST'])
+def demo_fusion():
+    payload = request.json or {}
+    audio_text = payload.get('audio_text','Namaste')
+    visual = payload.get('visual',{'frames':10,'motions':1})
+    sensor = payload.get('sensor',{'lat':0,'lon':0})
+    fused = fusion.fuse(audio_text, visual, sensor)
+    lesson = generative.generate_lesson({'topic':'market phrases','context':fused,'languages':['hi','en']})
+    return jsonify({'fused': fused, 'lesson': lesson})
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
